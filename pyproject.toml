@@ -16,6 +16,9 @@ numpy = "^2.1"
 tensorboard = "^2.18"
 setuptools = "^75.0"          # tensorboard imports pkg_resources
 tqdm = "^4.66"
+# Viewer dependencies (optional, only used by viewer.py — not needed for training).
+pygame = "^2.6"
+PyOpenGL = "^3.1.7"
 
 [build-system]
 requires = ["poetry-core>=1.9.0"]
