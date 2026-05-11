@@ -27,6 +27,8 @@ PURSUER = (220, 60, 60)       # red
 EVADER = (40, 110, 220)       # blue
 AGENT = (40, 110, 220)        # same as evader by default
 TARGET = (245, 165, 55)       # orange
+OBSTACLE = (96, 102, 114)     # dark slate gray for walls
+OBSTACLE_EDGE = (60, 64, 74)
 CATCH_ZONE = (220, 60, 60, 64)   # translucent red fill
 CATCH_ZONE_RING = (220, 60, 60)
 TRAIL_PURSUER = (220, 60, 60)
@@ -40,15 +42,27 @@ class Renderer2D:
     `clear()`, the various `draw_*` helpers, and `flip()` once per frame.
     """
 
-    def __init__(self, world_w: int, world_h: int, title: str):
+    def __init__(self, world_w: int, world_h: int, title: str,
+                 win_w: int | None = None, win_h: int | None = None):
         import pygame as pg
 
         pg.init()
-        self.surface = pg.display.set_mode((world_w, world_h))
+        win_w = win_w or world_w
+        win_h = win_h or world_h
+        self.window = pg.display.set_mode((win_w, win_h))
         pg.display.set_caption(title)
 
         self.world_w = world_w
         self.world_h = world_h
+        self.win_w = win_w
+        self.win_h = win_h
+        # Drawing target. When window != world, we draw into this off-screen
+        # surface in world coords and blit a scaled copy to `self.window` at
+        # flip() time. Otherwise this just aliases `self.window`.
+        if (win_w, win_h) == (world_w, world_h):
+            self.surface = self.window
+        else:
+            self.surface = pg.Surface((world_w, world_h))
         self.font = pg.font.SysFont("Helvetica,Arial,Sans", 13)
         self.font_big = pg.font.SysFont("Helvetica,Arial,Sans", 18, bold=True)
         # Per-pixel-alpha overlay for translucent fills (catch zone, trails).
@@ -63,6 +77,9 @@ class Renderer2D:
     def flip(self) -> None:
         import pygame as pg
         self.surface.blit(self.overlay, (0, 0))
+        if self.surface is not self.window:
+            scaled = pg.transform.smoothscale(self.surface, (self.win_w, self.win_h))
+            self.window.blit(scaled, (0, 0))
         pg.display.flip()
 
     def close(self) -> None:
@@ -83,6 +100,14 @@ class Renderer2D:
         import pygame as pg
         pg.draw.rect(self.surface, GRID_BOLD,
                      pg.Rect(0, 0, self.world_w, self.world_h), width=2)
+
+    def draw_obstacles(self, obstacles) -> None:
+        """Filled rectangles + dark outline. `obstacles` is iterable of (x0,y0,x1,y1)."""
+        import pygame as pg
+        for (x0, y0, x1, y1) in obstacles:
+            rect = pg.Rect(int(x0), int(y0), int(x1 - x0), int(y1 - y0))
+            pg.draw.rect(self.surface, OBSTACLE, rect)
+            pg.draw.rect(self.surface, OBSTACLE_EDGE, rect, width=2)
 
     # ---- agents / vehicles ----------------------------------------------------
     def draw_vehicle(self, x: float, y: float, phi: float, color, scale: float = 1.0) -> None:

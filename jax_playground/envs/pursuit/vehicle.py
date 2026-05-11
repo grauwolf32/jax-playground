@@ -35,15 +35,47 @@ class VehicleParams(NamedTuple):
     timestep_limit: int       # static
     max_speed: jnp.ndarray
     max_dist: jnp.ndarray
+    obstacles: jnp.ndarray    # (N, 4) AABBs as (x0, y0, x1, y1); N static
+
+
+def _default_obstacles(world_w: float, world_h: float) -> jnp.ndarray:
+    """Two mirrored Г shapes near the top of the arena.
+
+    Geometry (for the default 1920×1440 world, scales with world size):
+    Left Г       Right Г (mirror)
+       ████      ████        horizontal bars across the top
+       █            █        verticals going down on the outside
+       █            █
+       █            █
+    Each Г is built from two overlapping AABBs.
+    """
+    w, h = float(world_w), float(world_h)
+    # bars are 1/24th of world height (~60 px on 1440 → reasonable thickness),
+    # placed 1/6 of the way from top, length 1/4 of world width on each side.
+    bar_t = h / 24.0
+    margin = w / 8.0
+    bar_len = w / 4.0
+    top_y = h / 6.0
+    bot_y = h * 5.0 / 6.0
+    # Left Г.
+    Lh = (margin, top_y, margin + bar_len, top_y + bar_t)             # horizontal bar
+    Lv = (margin, top_y, margin + bar_t, bot_y)                       # vertical bar
+    # Right Г (mirrored).
+    Rh = (w - margin - bar_len, top_y, w - margin, top_y + bar_t)
+    Rv = (w - margin - bar_t, top_y, w - margin, bot_y)
+    return jnp.array([Lh, Lv, Rh, Rv], dtype=jnp.float32)
 
 
 def default_params(max_dw: float = 2.0,
                    max_ds: float = 6.0,
                    friction_k: float = 0.013,
                    dt: float = 0.5,
-                   world_w: int = 960,
-                   world_h: int = 720,
-                   timestep_limit: int = 1500) -> VehicleParams:
+                   world_w: int = 1920,
+                   world_h: int = 1440,
+                   timestep_limit: int = 1500,
+                   obstacles: jnp.ndarray | None = None) -> VehicleParams:
+    if obstacles is None:
+        obstacles = _default_obstacles(world_w, world_h)
     max_speed = float(jnp.sqrt(max_ds / friction_k))
     max_dist = float(jnp.sqrt(world_w * world_w + world_h * world_h))
     return VehicleParams(
@@ -56,6 +88,7 @@ def default_params(max_dw: float = 2.0,
         timestep_limit=int(timestep_limit),
         max_speed=jnp.float32(max_speed),
         max_dist=jnp.float32(max_dist),
+        obstacles=obstacles.astype(jnp.float32),
     )
 
 
@@ -100,6 +133,30 @@ def step(state: jnp.ndarray, alpha: jnp.ndarray, beta: jnp.ndarray,
     new_vx = jnp.where(over_left | over_right, 0.0, new_vx)
     new_y = jnp.where(over_top, 0.0, jnp.where(over_bot, params.world_h, new_y))
     new_vy = jnp.where(over_top | over_bot, 0.0, new_vy)
+
+    # Static obstacles: AABBs. If the vehicle ends up inside one, push it
+    # back to the nearest face and zero the inward velocity component. The
+    # Python loop unrolls statically (obstacles.shape[0] is a static int).
+    for i in range(params.obstacles.shape[0]):
+        x0, y0, x1, y1 = (params.obstacles[i, 0], params.obstacles[i, 1],
+                          params.obstacles[i, 2], params.obstacles[i, 3])
+        inside = (new_x > x0) & (new_x < x1) & (new_y > y0) & (new_y < y1)
+        dx_left = new_x - x0
+        dx_right = x1 - new_x
+        dy_top = new_y - y0
+        dy_bot = y1 - new_y
+        min_d = jnp.minimum(jnp.minimum(dx_left, dx_right),
+                             jnp.minimum(dy_top, dy_bot))
+        push_left = inside & (min_d == dx_left)
+        push_right = inside & (min_d == dx_right)
+        push_top = inside & (min_d == dy_top)
+        push_bot = inside & (min_d == dy_bot)
+        new_x = jnp.where(push_left, x0,
+                           jnp.where(push_right, x1, new_x))
+        new_y = jnp.where(push_top, y0,
+                           jnp.where(push_bot, y1, new_y))
+        new_vx = jnp.where(push_left | push_right, 0.0, new_vx)
+        new_vy = jnp.where(push_top | push_bot, 0.0, new_vy)
 
     # Cap |v| at max_speed.
     speed = jnp.sqrt(new_vx * new_vx + new_vy * new_vy)

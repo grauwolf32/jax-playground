@@ -327,7 +327,18 @@ def run_2d_viewer(env_kind: str, action_fn, args) -> None:
     world_w = int(params.world_w)
     world_h = int(params.world_h)
     title = f"{env_kind}-v0"
-    renderer = Renderer2D(world_w, world_h, title)
+    # If the world is too tall to fit on a typical 1080p monitor, render at
+    # a smaller window size. The render2d helpers draw in world pixels, so we
+    # downscale by setting up a smaller window and blitting a scaled surface.
+    max_window_h = 900
+    if world_h > max_window_h:
+        scale = max_window_h / float(world_h)
+        win_w = int(world_w * scale)
+        win_h = max_window_h
+    else:
+        scale = 1.0
+        win_w, win_h = world_w, world_h
+    renderer = Renderer2D(world_w, world_h, title, win_w=win_w, win_h=win_h)
 
     trails = {
         "evader": deque(maxlen=300),
@@ -392,6 +403,7 @@ def run_2d_viewer(env_kind: str, action_fn, args) -> None:
         renderer.clear()
         renderer.draw_grid()
         renderer.draw_border()
+        renderer.draw_obstacles(np.asarray(params.obstacles))
 
         if env_kind == "pursuit":
             from jax_playground.envs.pursuit.env import _CATCH_RADIUS
@@ -442,7 +454,9 @@ def run_2d_viewer(env_kind: str, action_fn, args) -> None:
                                 color=(180, 60, 60), big=True)
 
         renderer.flip()
-        clock.tick(int(1.0 / float(params.dt)))   # match dt to wall-clock
+        # dt=0.5 → real-time would be 2 fps, painfully slow to watch.
+        # Run at 30 fps (≈15× real-time playback).
+        clock.tick(30)
 
     renderer.close()
 
