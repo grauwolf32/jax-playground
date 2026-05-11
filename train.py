@@ -268,6 +268,9 @@ def main() -> None:
     p.add_argument("--log-std-init", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--name", default=None)
+    p.add_argument("--resume", type=Path, default=None,
+                   help="Path to a model.pkl to warm-start from. Loads params + "
+                        "obs_stats; opt_state is fresh (Adam moments restart).")
     args = p.parse_args()
 
     params = envlib.REGISTRY[args.env]["default_params"]()
@@ -292,14 +295,44 @@ def main() -> None:
     opt_state = optimizer.init(net_params)
     obs_stats = init_running_stats(obs_dim)
 
+    if args.resume is not None:
+        with args.resume.open("rb") as _f:
+            _ckpt = pickle.load(_f)
+        # Sanity-check architecture matches what we just constructed.
+        prev_hidden = _ckpt["args"].get("hidden")
+        if prev_hidden is not None and list(prev_hidden) != list(args.hidden):
+            raise ValueError(
+                f"--resume hidden mismatch: ckpt={prev_hidden}, current={args.hidden}"
+            )
+        net_params = _ckpt["params"]
+        ckpt_stats = _ckpt["obs_stats"]
+        obs_stats = RunningStats(
+            mean=jnp.asarray(ckpt_stats.mean),
+            var=jnp.asarray(ckpt_stats.var),
+            count=jnp.asarray(ckpt_stats.count),
+        )
+        # Re-init opt state against the loaded params (fresh Adam moments).
+        opt_state = optimizer.init(net_params)
+        print(f"[train] resumed from {args.resume}  "
+              f"(loaded params + obs_stats, opt_state restarted)")
+
     # JIT the update step once. Inputs include the per-update RNG so signature is
     # (carry, rng) -> (carry, scalars).
     jit_update = jax.jit(train_update)
 
     csv_path = run_dir / "metrics.csv"
+    best_path = run_dir / "best.pkl"
+    # EMA over rollouts smooths out per-rollout noise (esp. the 2-cycle from
+    # n_steps not dividing timestep_limit cleanly). When the EMA improves, snapshot
+    # the params as best.pkl. Format matches model.pkl so play.py / viewer.py
+    # load it the same way.
+    ema_alpha = 0.1
+    ema_reward: float | None = None
+    best_reward = float("-inf")
+    best_update = 0
     with csv_path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["update", "elapsed_s", "rew_mean", "kl", "clip", "ent", "v"])
+        writer.writerow(["update", "elapsed_s", "rew_mean", "ema_rew", "kl", "clip", "ent", "v"])
 
         carry = (env_state, obs, net_params, opt_state, obs_stats, rng)
         t0 = time.time()
@@ -308,11 +341,14 @@ def main() -> None:
             carry, scalars = jit_update(carry, rng_in)
             # Force materialization (otherwise prints will lag behind compute)
             scalars = jax.tree_util.tree_map(lambda x: float(x), scalars)
+            cur_rew = scalars["rew_mean"]
+            ema_reward = cur_rew if ema_reward is None else ema_reward + ema_alpha * (cur_rew - ema_reward)
             elapsed = time.time() - t0
             steps = (update + 1) * args.n_envs * args.n_steps
             print(f"[u {update+1:4d}/{args.updates}] "
                   f"steps={steps:>10,}  "
-                  f"rew={scalars['rew_mean']:+.3f}  "
+                  f"rew={cur_rew:+.3f}  "
+                  f"ema={ema_reward:+.3f}  "
                   f"kl={scalars['kl']:+.4f}  "
                   f"clip={scalars['clip']:.3f}  "
                   f"ent={scalars['ent']:+.3f}  "
@@ -321,9 +357,24 @@ def main() -> None:
                   f"t={elapsed:.0f}s  "
                   f"sps={steps/max(elapsed,1e-9):,.0f}")
             writer.writerow([update + 1, f"{elapsed:.1f}",
-                             scalars["rew_mean"], scalars["kl"],
+                             cur_rew, ema_reward, scalars["kl"],
                              scalars["clip"], scalars["ent"], scalars["v"]])
             f.flush()
+
+            # Save best.pkl whenever EMA improves. Skip the first few updates so
+            # we don't snapshot a not-yet-warmed EMA (need a window of ~1/alpha).
+            if update >= 10 and ema_reward > best_reward:
+                best_reward = ema_reward
+                best_update = update + 1
+                _, _, net_params_cur, _, obs_stats_cur, _ = carry
+                with best_path.open("wb") as bf:
+                    pickle.dump({
+                        "args": vars(args),
+                        "params": jax.device_get(net_params_cur),
+                        "obs_stats": jax.device_get(obs_stats_cur),
+                        "best_reward_ema": float(best_reward),
+                        "best_update": int(best_update),
+                    }, bf)
 
     # Save final params + obs_stats
     env_state, obs, net_params, opt_state, obs_stats, rng = carry
@@ -334,7 +385,9 @@ def main() -> None:
     }
     with (run_dir / "model.pkl").open("wb") as f:
         pickle.dump(ckpt, f)
-    print(f"[train] saved → {run_dir / 'model.pkl'}")
+    print(f"[train] saved final → {run_dir / 'model.pkl'}")
+    if best_path.exists():
+        print(f"[train] best ema_rew={best_reward:+.3f} at update {best_update} → {best_path}")
 
 
 if __name__ == "__main__":
