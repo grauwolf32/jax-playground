@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "jax-hyrosphere"
+version = "0.1.0"
+description = "JAX rewrite of the HyroSphere / LinearSphere physics + PPO training, vectorized via jax.vmap and jit-compiled."
+authors = ["grauwolf32"]
+readme = "README.md"
+packages = [{ include = "jax_hyrosphere" }]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+jax = { version = "^0.7", extras = ["cuda12"] }
+flax = "^0.10"
+optax = "^0.2.4"
+chex = "^0.1.86"
+numpy = "^2.1"
+tensorboard = "^2.18"
+setuptools = "^75.0"          # tensorboard imports pkg_resources
+tqdm = "^4.66"
+
+[build-system]
+requires = ["poetry-core>=1.9.0"]
+build-backend = "poetry.core.masonry.api"
