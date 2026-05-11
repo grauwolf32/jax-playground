@@ -254,7 +254,12 @@ def lidar_distances(px, py, phi, params: VehicleParams) -> jnp.ndarray:
 
     Ray i is at angle (phi + 2π·i/N) — front, then sweeping CCW (in screen
     coords, which is CW on screen since +y is down). Output shape (N_RAYS,).
+
+    Clamped to max_dist so degenerate rays (direction near-parallel to an
+    axis) can't produce arbitrarily large distances via the safe_dx/eps
+    division — feeding huge values into obs would wreck running-stats
+    normalization downstream.
     """
     def one(angle_offset):
         return ray_distance(px, py, phi + angle_offset, params)
-    return jax.vmap(one)(_RAY_ANGLES)
+    return jnp.minimum(jax.vmap(one)(_RAY_ANGLES), params.max_dist)

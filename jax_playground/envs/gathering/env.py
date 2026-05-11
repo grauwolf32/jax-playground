@@ -61,6 +61,12 @@ def _random_place(key, params: VehicleParams):
 
 def _obs(es: EnvState, params: VehicleParams) -> jnp.ndarray:
     s = es.agent
+    s_speed = params.max_speed
+    s_dist = params.max_dist
+    s_acc = params.max_ds
+    s_phi = jnp.float32(jnp.pi)
+    s_om = params.max_dw
+
     dx1, dy1 = s[0] - es.target_1[0], s[1] - es.target_1[1]
     dx2, dy2 = s[0] - es.target_2[0], s[1] - es.target_2[1]
     d1 = jnp.sqrt(dx1 * dx1 + dy1 * dy1)
@@ -71,13 +77,16 @@ def _obs(es: EnvState, params: VehicleParams) -> jnp.ndarray:
     swap = d1 > d2
     d1, d2 = jnp.where(swap, d2, d1), jnp.where(swap, d1, d2)
     t1a, t2a = jnp.where(swap, t2a, t1a), jnp.where(swap, t1a, t2a)
-    lidar = vehicle.lidar_distances(s[0], s[1], s[6], params)   # (8,)
-    # Drop s[0], s[1] (world coords) — target info is already relative,
-    # so the policy can't memorize obstacle layout from this obs alone.
+    lidar = vehicle.lidar_distances(s[0], s[1], s[6], params) / s_dist   # (8,)
+    # All quantities scaled to ~[-1, 1]; world coords dropped so policy
+    # can't memorize obstacle layout.
     return jnp.concatenate([
-        jnp.array([s[2], s[3], s[4], s[5], s[6], s[7]], dtype=jnp.float32),   # 6
-        jnp.array([d1, t1a, d2, t2a], dtype=jnp.float32),                     # 4
-        lidar.astype(jnp.float32),    # 8
+        jnp.array([s[2] / s_speed, s[3] / s_speed,
+                   s[4] / s_acc, s[5] / s_acc,
+                   s[6] / s_phi, s[7] / s_om], dtype=jnp.float32),         # 6
+        jnp.array([d1 / s_dist, t1a / s_phi,
+                   d2 / s_dist, t2a / s_phi], dtype=jnp.float32),           # 4
+        lidar.astype(jnp.float32),                                          # 8
     ])
 
 

@@ -37,9 +37,9 @@ class ActorCritic(nn.Module):
         )(a)
         log_std_raw = self.param("log_std", lambda _, shape: jnp.full(shape, self.log_std_init),
                                   (self.act_dim,))
-        # Clamp log_std to a numerically safe range so the policy can't
-        # collapse std → 0 (which makes log_prob diverge → NaN).
-        log_std = jnp.clip(log_std_raw, -5.0, 2.0)
+        # Clamp log_std tightly so the policy can't collapse std → 0 (which
+        # makes log_prob diverge → NaN). Lower bound -2 keeps std ≥ 0.135.
+        log_std = jnp.clip(log_std_raw, -2.0, 2.0)
 
         c = x
         for h in self.hidden:

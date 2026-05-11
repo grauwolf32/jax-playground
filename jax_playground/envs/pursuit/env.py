@@ -32,10 +32,16 @@ _PURSUER_TURN_SCALE = jnp.float32(jnp.sqrt(2.0))   # sqrt(max_dw), the original 
 
 
 # Rewards (caught_penalty, step_reward, speed_bonus, distance_bonus) scaled
-# 1/timestep_limit so episodic sums stay O(1).
+# so per-step rewards live in O(1/T) range and episodic sums are O(few).
+# distance_bonus is normalized by max_dist so per-step contribution is
+# bounded — the prior 5/T·(d−offset) scaled with raw d (≤2400) and dwarfed
+# both the catch penalty and any value-function target.
 def _reward_consts(params: VehicleParams):
     T = params.timestep_limit
-    return jnp.float32(-100.0), jnp.float32(2.0 / T), jnp.float32(1.0 / T), jnp.float32(5.0 / T)
+    return (jnp.float32(-10.0),
+            jnp.float32(2.0 / T),
+            jnp.float32(1.0 / (T * params.max_speed)),
+            jnp.float32(5.0 / (T * params.max_dist)))
 
 
 class EnvState(NamedTuple):
@@ -56,19 +62,29 @@ def _random_place(key: jax.Array, params: VehicleParams):
 def _obs(es: EnvState, params: VehicleParams) -> jnp.ndarray:
     e = es.evader
     p = es.pursuer
-    # Drop e[0], e[1] (world position) so the policy can't memorize
-    # obstacle layout via absolute coords.
-    dx_rel = p[0] - e[0]
-    dy_rel = p[1] - e[1]
-    dvx_rel = p[2] - e[2]
-    dvy_rel = p[3] - e[3]
-    dphi_rel = p[6] - e[6]
-    d = jnp.sqrt(dx_rel * dx_rel + dy_rel * dy_rel)
-    lidar = vehicle.lidar_distances(e[0], e[1], e[6], params)   # (8,)
+    # All quantities scaled to roughly [-1, 1] so the network sees bounded
+    # inputs without depending on running-stats normalization (which can be
+    # cold for the first rollout).
+    s_speed = params.max_speed
+    s_dist = params.max_dist
+    s_acc = params.max_ds
+    s_phi = jnp.float32(jnp.pi)
+    s_om = params.max_dw
+
+    dx_rel = (p[0] - e[0]) / s_dist
+    dy_rel = (p[1] - e[1]) / s_dist
+    dvx_rel = (p[2] - e[2]) / s_speed
+    dvy_rel = (p[3] - e[3]) / s_speed
+    dphi_rel = (p[6] - e[6]) / s_phi
+    d = jnp.sqrt(((p[0] - e[0]) ** 2 + (p[1] - e[1]) ** 2)) / s_dist
+    lidar = vehicle.lidar_distances(e[0], e[1], e[6], params) / s_dist   # (8,)
     return jnp.concatenate([
-        jnp.array([e[2], e[3], e[4], e[5], e[6], e[7]], dtype=jnp.float32),   # 6
-        jnp.array([dx_rel, dy_rel, dvx_rel, dvy_rel, dphi_rel, d], dtype=jnp.float32),  # 6
-        lidar.astype(jnp.float32),    # 8
+        jnp.array([e[2] / s_speed, e[3] / s_speed,
+                   e[4] / s_acc, e[5] / s_acc,
+                   e[6] / s_phi, e[7] / s_om], dtype=jnp.float32),         # 6
+        jnp.array([dx_rel, dy_rel, dvx_rel, dvy_rel, dphi_rel, d],
+                  dtype=jnp.float32),                                       # 6
+        lidar.astype(jnp.float32),                                          # 8
     ])
 
 

@@ -90,6 +90,15 @@ def main() -> None:
     elif env_kind == "gathering":
         def env_diag(env_state):
             return ("score", float(env_state.score[0]))
+    elif env_kind == "swarm":
+        # Use the env's own Chamfer + target_scale so the metric matches
+        # what the reward saw.
+        from jax_playground.envs.swarm import physics as _swarm_phys
+        def env_diag(env_state):
+            pos = env_state.pos[0]
+            target = env_state.target[0]
+            err = float(_swarm_phys.chamfer_centered(pos, target))
+            return ("chamfer_px", err)
     else:
         env_diag = lambda env_state: ("-", 0.0)
 

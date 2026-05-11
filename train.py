@@ -56,27 +56,35 @@ def make_train_step(env_kind: str, params, args):
     model = ActorCritic(act_dim=act_dim, hidden=tuple(args.hidden),
                          log_std_init=args.log_std_init)
 
-    def env_rollout(net_params, env_state, obs, rng, n_steps: int):
-        """Roll n_steps in env, return transitions + final value bootstrap."""
+    def env_rollout(net_params, env_state, raw_obs, obs_stats, rng, n_steps: int):
+        """Roll n_steps in env, return transitions + final value bootstrap.
+
+        Normalizes obs at sampling time using the CURRENT obs_stats — the loss
+        must use the same normalization for the PPO ratio to make sense.
+        Stores normalized obs in the transition; raw obs are accumulated
+        separately so obs_stats can be updated after the rollout.
+        """
         def body(carry, _):
-            env_state, obs, rng = carry
+            env_state, raw_obs, rng = carry
             rng, k = jax.random.split(rng)
-            mean, log_std, value = model.apply(net_params, obs)
+            norm_obs = normalize(raw_obs, obs_stats)
+            mean, log_std, value = model.apply(net_params, norm_obs)
             noise = jax.random.normal(k, mean.shape)
             action = mean + jnp.exp(log_std) * noise
             log_prob = gaussian_log_prob(action, mean, log_std)
-            env_state, next_obs, reward, done, _info = step_batch(env_state, action)
+            env_state, next_raw_obs, reward, done, _info = step_batch(env_state, action)
             transition = Transition(
-                obs=obs, action=action, log_prob=log_prob,
+                obs=norm_obs, action=action, log_prob=log_prob,
                 value=value, reward=reward, done=done,
             )
-            return (env_state, next_obs, rng), transition
+            return (env_state, next_raw_obs, rng), (transition, raw_obs)
 
-        (env_state, last_obs, rng), traj = jax.lax.scan(
-            body, (env_state, obs, rng), xs=None, length=n_steps
+        (env_state, last_raw_obs, rng), (traj, raw_obs_traj) = jax.lax.scan(
+            body, (env_state, raw_obs, rng), xs=None, length=n_steps
         )
-        _, _, last_value = model.apply(net_params, last_obs)
-        return traj, env_state, last_obs, last_value, rng
+        norm_last_obs = normalize(last_raw_obs, obs_stats)
+        _, _, last_value = model.apply(net_params, norm_last_obs)
+        return traj, raw_obs_traj, env_state, last_raw_obs, last_value, rng
 
     def gae(rewards, values, dones, last_value, gamma=args.gamma, lam=args.gae_lambda):
         """Backward GAE scan. dones is per-step termination flag (after step)."""
@@ -102,8 +110,10 @@ def make_train_step(env_kind: str, params, args):
         new_logp = gaussian_log_prob(mb_action, mean, log_std)
         ratio = jnp.exp(new_logp - mb_old_logp)
 
-        # Normalize advantages (per mini-batch)
-        adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+        # Normalize advantages (per mini-batch). Floor std at 1e-3 so a
+        # degenerate batch with near-constant advantage can't amplify noise
+        # into a huge ratio.
+        adv = (mb_adv - mb_adv.mean()) / jnp.maximum(mb_adv.std(), 1e-3)
 
         # Clipped surrogate
         unclipped = ratio * adv
@@ -135,36 +145,29 @@ def make_train_step(env_kind: str, params, args):
 
     def train_update(carry, rng):
         """One PPO update cycle: collect rollout, compute GAE, n_epochs of SGD."""
-        env_state, obs, net_params, opt_state, obs_stats, rng = carry
+        env_state, raw_obs, net_params, opt_state, obs_stats, rng = carry
 
-        # 1. collect (n_steps × n_envs)
+        # 1. collect (n_steps × n_envs). Rollout normalizes obs with CURRENT
+        # obs_stats — same normalization used by the loss this cycle.
         rng, k = jax.random.split(rng)
-        traj, env_state, last_obs, last_value, _ = env_rollout(
-            net_params, env_state, obs, k, args.n_steps
+        traj, raw_obs_traj, env_state, last_raw_obs, last_value, _ = env_rollout(
+            net_params, env_state, raw_obs, obs_stats, k, args.n_steps
         )
-        obs = last_obs
+        raw_obs = last_raw_obs
 
-        # 2. update running obs stats from the entire rollout
-        flat_obs = traj.obs.reshape(-1, obs_dim)
-        obs_stats = update_running_stats(obs_stats, flat_obs)
+        # 2. obs running stats are intentionally NOT updated — env-level
+        # scaling already produces obs in roughly [-1, 1]. Updating stats
+        # with a partial-rollout view caused divide-by-tiny-variance NaN
+        # explosions in dims that start near-zero (vx, ax, omega, …).
+        _ = raw_obs_traj
 
-        # 3. normalize observations using updated stats. We deliberately do
-        # this AFTER collection so values used by the rollout aren't fudged;
-        # the loss recomputes them anyway from the rollout's stored obs.
-        norm_obs = normalize(traj.obs, obs_stats)
-        # Also normalize last_obs for value bootstrap
-        norm_last_obs = normalize(last_obs, obs_stats)
-        _, _, norm_last_value = model.apply(net_params, norm_last_obs)
+        # 3. GAE on values that came out of the rollout (already from the
+        # normalized forward).
+        adv = gae(traj.reward, traj.value, traj.done, last_value)
+        returns = adv + traj.value
 
-        # 4. compute GAE on values from the *normalized* policy (we recompute
-        # values from norm_obs to stay consistent).
-        _, _, norm_values = model.apply(net_params, norm_obs.reshape(-1, obs_dim))
-        norm_values = norm_values.reshape(traj.reward.shape)
-        adv = gae(traj.reward, norm_values, traj.done, norm_last_value)
-        returns = adv + norm_values
-
-        # Flatten time × env for minibatching
-        b_obs = norm_obs.reshape(-1, obs_dim)
+        # Flatten time × env for minibatching. traj.obs is already normalized.
+        b_obs = traj.obs.reshape(-1, obs_dim)
         b_action = traj.action.reshape(-1, act_dim)
         b_old_logp = traj.log_prob.reshape(-1)
         b_adv = adv.reshape(-1)
@@ -224,7 +227,7 @@ def make_train_step(env_kind: str, params, args):
 
         mean_reward = traj.reward.mean()
         mean_done = traj.done.mean()
-        carry = (env_state, obs, net_params, opt_state, obs_stats, rng)
+        carry = (env_state, raw_obs, net_params, opt_state, obs_stats, rng)
         scalars = {
             "rew_mean": mean_reward,
             "done_frac": mean_done,

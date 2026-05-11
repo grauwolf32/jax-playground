@@ -13,6 +13,7 @@ returns (reset_batch_fn, step_batch_fn, obs_dim, act_dim).
 from __future__ import annotations
 
 import jax
+import jax.numpy as jnp
 
 from jax_playground.envs.hyrosphere import env as hyro_env
 from jax_playground.envs.hyrosphere.physics import default_params as default_hyro_params
@@ -62,6 +63,18 @@ try:
 except ImportError:
     pass
 
+try:
+    from jax_playground.envs.swarm import env as swarm_env  # noqa: F401
+    from jax_playground.envs.swarm.physics import default_params as default_swarm_params
+    REGISTRY["swarm"] = {
+        "env": swarm_env,
+        "default_params": default_swarm_params,
+        "obs_dim": swarm_env.OBS_DIM,
+        "act_dim": swarm_env.ACT_DIM,
+    }
+except ImportError:
+    pass
+
 
 def list_envs() -> list[str]:
     return list(REGISTRY.keys())
@@ -74,13 +87,33 @@ def make_batched(env_kind: str, params, n_envs: int):
     env_mod = entry["env"]
     obs_dim, act_dim = entry["obs_dim"], entry["act_dim"]
 
+    # Swarm envs return per-env outputs of shape (n_agents, …) and a scalar
+    # reward / done shared across the agents in that env. We flatten to
+    # (n_envs · n_agents, …) on the way out and broadcast reward/done so
+    # train.py can keep treating the leading axis as the trainer batch dim.
+    is_swarm = bool(getattr(env_mod, "IS_SWARM", False))
+    n_agents = int(getattr(params, "n_agents", 1)) if is_swarm else 1
+
     @jax.jit
     def reset_batch(key: jax.Array):
         keys = jax.random.split(key, n_envs)
-        return jax.vmap(lambda k: env_mod.env_reset(k, params))(keys)
+        states, obs = jax.vmap(lambda k: env_mod.env_reset(k, params))(keys)
+        if is_swarm:
+            obs = obs.reshape(n_envs * n_agents, obs_dim)
+        return states, obs
 
     @jax.jit
     def step_batch(states, actions):
-        return jax.vmap(lambda s, a: env_mod.env_step(s, a, params))(states, actions)
+        if is_swarm:
+            actions = actions.reshape(n_envs, n_agents, act_dim)
+        states, obs, reward, done, info = jax.vmap(
+            lambda s, a: env_mod.env_step(s, a, params)
+        )(states, actions)
+        if is_swarm:
+            obs = obs.reshape(n_envs * n_agents, obs_dim)
+            reward = jnp.repeat(reward, n_agents)
+            done = jnp.repeat(done, n_agents)
+            # info stays per-env (n_envs,) — useful diagnostics, not per-agent.
+        return states, obs, reward, done, info
 
     return reset_batch, step_batch, obs_dim, act_dim

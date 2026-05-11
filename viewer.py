@@ -464,18 +464,445 @@ def run_2d_viewer(env_kind: str, action_fn, args) -> None:
     renderer.close()
 
 
+def _build_action_fn(ckpt, act_dim: int) -> "callable":
+    """Return a jit'd deterministic policy function from a loaded checkpoint."""
+    saved = ckpt["args"]
+    model = ActorCritic(
+        act_dim=act_dim,
+        hidden=tuple(saved.get("hidden", [256, 256])),
+        log_std_init=saved.get("log_std_init", 0.0),
+    )
+    net_params = ckpt["params"]
+    obs_stats = RunningStats(
+        mean=jnp.asarray(ckpt["obs_stats"].mean),
+        var=jnp.asarray(ckpt["obs_stats"].var),
+        count=jnp.asarray(ckpt["obs_stats"].count),
+    )
+
+    @jax.jit
+    def _act(obs):
+        norm = normalize(obs, obs_stats)
+        mean, _ls, _v = model.apply(net_params, norm)
+        return mean
+
+    def fn(obs_np: np.ndarray) -> np.ndarray:
+        return np.asarray(_act(jnp.asarray(obs_np)))
+    return fn
+
+
+def run_2d_viewer_selfplay(args, self_ckpt) -> None:
+    """Pygame 2D viewer for pursuit_selfplay. Renders both vehicles, each
+    driven by its own (deterministic) policy.
+    """
+    import pygame as pg
+    from collections import deque
+
+    from jax_playground.envs.pursuit_selfplay import env as sp_env
+    from jax_playground.envs.pursuit.vehicle import default_params as default_v_params
+    from jax_playground.render2d import (
+        Renderer2D, PURSUER, EVADER, CATCH_ZONE, TRAIL_PURSUER, TRAIL_EVADER,
+    )
+
+    params = default_v_params()
+    obs_dim, act_dim = sp_env.OBS_DIM, sp_env.ACT_DIM
+
+    role = self_ckpt["args"].get("role", self_ckpt.get("role", "pursuer"))
+    self_fn = _build_action_fn(self_ckpt, act_dim)
+
+    opp_path = args.opp_model or self_ckpt["args"].get("opp_model")
+    if opp_path is None:
+        print("[viewer] no opponent — stationary")
+        opp_fn = lambda _o: np.zeros(act_dim, dtype=np.float32)
+    else:
+        print(f"[viewer] opponent ← {opp_path}")
+        with Path(opp_path).open("rb") as f:
+            opp_ckpt = pickle.load(f)
+        opp_fn = _build_action_fn(opp_ckpt, act_dim)
+
+    print(f"[viewer] role={role}  run={args.run}")
+
+    reset_one = jax.jit(lambda k: sp_env.env_reset(k, params))
+    step_one = jax.jit(lambda s, ae, ap: sp_env.env_step(s, ae, ap, params))
+
+    rng = jax.random.PRNGKey(args.seed)
+    rng, k = jax.random.split(rng)
+    env_state, evader_obs, pursuer_obs = reset_one(k)
+
+    world_w = int(params.world_w)
+    world_h = int(params.world_h)
+    max_window_h = 900
+    if world_h > max_window_h:
+        scale = max_window_h / float(world_h)
+        win_w, win_h = int(world_w * scale), max_window_h
+    else:
+        win_w, win_h = world_w, world_h
+    renderer = Renderer2D(world_w, world_h, "pursuit_selfplay-v0",
+                           win_w=win_w, win_h=win_h)
+
+    trails = {
+        "evader": deque(maxlen=300),
+        "pursuer": deque(maxlen=300),
+    }
+    paused = False
+    step_count = 0
+    last_reward = 0.0
+    clock = pg.time.Clock()
+    running = True
+    role_is_evader = (role == "evader")
+    help_lines = [
+        f"trained:  {role}",
+        f"opp:      {'(stationary)' if opp_path is None else Path(opp_path).parent.name}",
+        "Space     pause",
+        "Backspace reset",
+        "Esc       quit",
+    ]
+
+    while running:
+        for ev in pg.event.get():
+            if ev.type == pg.QUIT:
+                running = False
+            elif ev.type == pg.KEYDOWN:
+                if ev.key in (pg.K_ESCAPE, pg.K_q):
+                    running = False
+                elif ev.key == pg.K_SPACE:
+                    paused = not paused
+                elif ev.key == pg.K_BACKSPACE:
+                    rng, k = jax.random.split(rng)
+                    env_state, evader_obs, pursuer_obs = reset_one(k)
+                    step_count = 0
+                    for d in trails.values():
+                        d.clear()
+
+        if not paused:
+            self_obs_np = np.asarray(evader_obs if role_is_evader else pursuer_obs)
+            opp_obs_np = np.asarray(pursuer_obs if role_is_evader else evader_obs)
+            self_a = self_fn(self_obs_np)
+            opp_a = opp_fn(opp_obs_np)
+            evader_a = self_a if role_is_evader else opp_a
+            pursuer_a = opp_a if role_is_evader else self_a
+            env_state, evader_obs, pursuer_obs, evader_r, done, info = step_one(
+                env_state, jnp.asarray(evader_a), jnp.asarray(pursuer_a)
+            )
+            step_count += 1
+            last_reward = float(evader_r) if role_is_evader else -float(evader_r)
+
+        evader = np.asarray(env_state.evader)
+        pursuer = np.asarray(env_state.pursuer)
+        trails["evader"].append((float(evader[0]), float(evader[1])))
+        trails["pursuer"].append((float(pursuer[0]), float(pursuer[1])))
+
+        renderer.clear()
+        renderer.draw_grid()
+        renderer.draw_border()
+        renderer.draw_obstacles(np.asarray(params.obstacles))
+
+        from jax_playground.envs.pursuit_selfplay.env import _CATCH_RADIUS
+        renderer.draw_catch_zone(float(pursuer[0]), float(pursuer[1]),
+                                  float(_CATCH_RADIUS))
+        renderer.draw_trail(list(trails["pursuer"]), TRAIL_PURSUER)
+        renderer.draw_trail(list(trails["evader"]), TRAIL_EVADER)
+        renderer.draw_vehicle(float(pursuer[0]), float(pursuer[1]),
+                               float(pursuer[6]), PURSUER)
+        renderer.draw_vehicle(float(evader[0]), float(evader[1]),
+                               float(evader[6]), EVADER)
+
+        d = float(np.hypot(pursuer[0] - evader[0], pursuer[1] - evader[1]))
+        renderer.draw_text("pursuit_selfplay-v0", 12, 10, big=True)
+        renderer.draw_hud_block([
+            f"t      {step_count * params.dt:6.2f} s   (step {step_count})",
+            f"d      {d:7.2f}   (catch ≤ 80)",
+            f"pursuer v = {float(np.hypot(pursuer[2], pursuer[3])):5.2f}",
+            f"evader  v = {float(np.hypot(evader[2], evader[3])):5.2f}",
+            f"reward ({role}) = {last_reward:+.4f}",
+        ], 12, 36)
+        renderer.draw_text(
+            f"pursuer{' ★' if not role_is_evader else ''}",
+            12, world_h - 38, color=PURSUER, big=True,
+        )
+        renderer.draw_text(
+            f"evader{' ★' if role_is_evader else ''}",
+            12, world_h - 20, color=EVADER,
+        )
+
+        for i, line in enumerate(help_lines):
+            renderer.draw_text(line, world_w - 250, 10 + i * 17,
+                                color=(110, 118, 130))
+        if paused:
+            renderer.draw_text("[PAUSED]", world_w - 100, world_h - 20,
+                                color=(180, 60, 60), big=True)
+
+        renderer.flip()
+        clock.tick(30)
+
+    renderer.close()
+
+
+def _w2s(world_pos, camera_world, zoom, window_center):
+    """world → screen: (world - camera_world) * zoom + window_center."""
+    return (world_pos - camera_world) * zoom + window_center
+
+
+def _draw_extended_grid(surface, camera_world, zoom, window_center,
+                        *, spacing: int = 80, bold_every: int = 4) -> None:
+    """Grid lines at world_x = k·spacing, transformed by camera+zoom; only
+    the visible k range is drawn. Adapts step density at extreme zooms by
+    multiplying spacing so the screen never gets carpeted with lines."""
+    import pygame as pg
+    from jax_playground.render2d import GRID, GRID_BOLD
+    win_w, win_h = surface.get_size()
+    # Scale spacing so on-screen step is between ~30 and ~160 px.
+    step_px = spacing * zoom
+    factor = 1
+    while step_px * factor < 30:
+        factor *= 2
+    while step_px * factor > 160 and factor > 1:
+        factor //= 2
+    eff_spacing = spacing * factor
+
+    cx, cy = float(camera_world[0]), float(camera_world[1])
+    wc_x, wc_y = float(window_center[0]), float(window_center[1])
+
+    # Visible world x range: x_world such that 0 <= (x_world - cx)*zoom + wc_x <= win_w
+    x_min_world = (0 - wc_x) / zoom + cx
+    x_max_world = (win_w - wc_x) / zoom + cx
+    k_min = int(np.floor(x_min_world / eff_spacing))
+    k_max = int(np.ceil(x_max_world / eff_spacing)) + 1
+    for k in range(k_min, k_max):
+        x_world = k * eff_spacing
+        x = int(round((x_world - cx) * zoom + wc_x))
+        color = GRID_BOLD if (k * factor) % bold_every == 0 else GRID
+        pg.draw.line(surface, color, (x, 0), (x, win_h))
+
+    y_min_world = (0 - wc_y) / zoom + cy
+    y_max_world = (win_h - wc_y) / zoom + cy
+    k_min = int(np.floor(y_min_world / eff_spacing))
+    k_max = int(np.ceil(y_max_world / eff_spacing)) + 1
+    for k in range(k_min, k_max):
+        y_world = k * eff_spacing
+        y = int(round((y_world - cy) * zoom + wc_y))
+        color = GRID_BOLD if (k * factor) % bold_every == 0 else GRID
+        pg.draw.line(surface, color, (0, y), (win_w, y))
+
+
+def _draw_world_border(surface, world_w: int, world_h: int,
+                        camera_world, zoom, window_center) -> None:
+    """World boundary transformed by camera+zoom — orientation reference."""
+    import pygame as pg
+    from jax_playground.render2d import GRID_BOLD
+    tl = _w2s(np.array([0.0, 0.0]), camera_world, zoom, window_center)
+    br = _w2s(np.array([float(world_w), float(world_h)]),
+              camera_world, zoom, window_center)
+    rect = pg.Rect(int(round(tl[0])), int(round(tl[1])),
+                   int(round(br[0] - tl[0])), int(round(br[1] - tl[1])))
+    pg.draw.rect(surface, GRID_BOLD, rect, width=2)
+
+
+def run_swarm_viewer(action_fn, args) -> None:
+    """Pygame 2D viewer for the swarm env with a follow-camera, scroll-wheel
+    zoom (around the cursor), and LMB-drag pan.
+
+    Camera state is `camera_world` (the world point shown at window center)
+    plus a `zoom` factor. When follow is on, camera_world EMAs toward the
+    swarm centroid so the swarm sits at window center. Mouse drag turns
+    follow off and gives manual control; C re-engages it.
+
+    Controls: SPACE pause, BACKSPACE reset, G ghost, W waves, C follow,
+    R reset zoom+camera, scroll = zoom, LMB drag = pan, Esc quit.
+    """
+    import pygame as pg
+
+    from jax_playground import envs as envlib
+    from jax_playground.envs.swarm import physics as swarm_phys
+    from jax_playground.envs.swarm.render import (
+        draw_target, draw_ghost, draw_agents, draw_wave_glow,
+    )
+    from jax_playground.render2d import Renderer2D
+
+    params = swarm_phys.default_params()
+    reset_b, step_b, obs_dim, act_dim = envlib.make_batched("swarm", params, 1)
+
+    rng = jax.random.PRNGKey(args.seed)
+    rng, k = jax.random.split(rng)
+    env_state, obs = reset_b(k)
+
+    world_w = int(params.world_w)
+    world_h = int(params.world_h)
+    renderer = Renderer2D(world_w, world_h, "swarm-v0",
+                           win_w=world_w, win_h=world_h)
+    win_center = np.array([world_w / 2.0, world_h / 2.0], dtype=np.float32)
+
+    paused = False
+    show_ghost = True
+    show_waves = True
+    follow_camera = True
+    # camera_world: world point shown at window center. zoom: world→screen scale.
+    camera_world = np.array([world_w / 2.0, world_h / 2.0], dtype=np.float32)
+    zoom = 1.0
+    CAMERA_EMA = 0.18
+    ZOOM_MIN, ZOOM_MAX = 0.1, 8.0
+
+    dragging = False
+    drag_last_screen = (0, 0)
+
+    step_count = 0
+    last_reward = 0.0
+    last_shape_err = 0.0
+    last_shape_err_n = 0.0
+    last_solved = 0.0
+    clock = pg.time.Clock()
+    running = True
+
+    help_lines = ([
+        "policy from --run is driving"] if action_fn else
+        ["no policy: agents are still (action=0)"]
+    ) + [
+        "Space         pause",
+        "Backspace     reset env",
+        "G             toggle ghost",
+        "W             toggle waves",
+        "C             toggle follow",
+        "R             reset view",
+        "scroll        zoom",
+        "LMB drag      pan",
+        "Esc           quit",
+    ]
+
+    while running:
+        mx, my = pg.mouse.get_pos()
+        for ev in pg.event.get():
+            if ev.type == pg.QUIT:
+                running = False
+            elif ev.type == pg.KEYDOWN:
+                if ev.key in (pg.K_ESCAPE, pg.K_q):
+                    running = False
+                elif ev.key == pg.K_SPACE:
+                    paused = not paused
+                elif ev.key == pg.K_BACKSPACE:
+                    rng, k = jax.random.split(rng)
+                    env_state, obs = reset_b(k)
+                    step_count = 0
+                elif ev.key == pg.K_g:
+                    show_ghost = not show_ghost
+                elif ev.key == pg.K_w:
+                    show_waves = not show_waves
+                elif ev.key == pg.K_c:
+                    follow_camera = not follow_camera
+                elif ev.key == pg.K_r:
+                    camera_world = np.array([world_w / 2.0, world_h / 2.0],
+                                             dtype=np.float32)
+                    zoom = 1.0
+                    follow_camera = True
+            elif ev.type == pg.MOUSEBUTTONDOWN:
+                if ev.button == 1:
+                    dragging = True
+                    drag_last_screen = ev.pos
+                    follow_camera = False     # manual pan disengages follow
+            elif ev.type == pg.MOUSEBUTTONUP and ev.button == 1:
+                dragging = False
+            elif ev.type == pg.MOUSEMOTION and dragging:
+                dx = ev.pos[0] - drag_last_screen[0]
+                dy = ev.pos[1] - drag_last_screen[1]
+                drag_last_screen = ev.pos
+                # World moves opposite mouse drag. Screen→world delta is /zoom.
+                camera_world = camera_world - np.array([dx, dy], dtype=np.float32) / zoom
+            elif ev.type == pg.MOUSEWHEEL:
+                # Zoom around the cursor: keep world point under cursor fixed.
+                factor = 1.15 if ev.y > 0 else 1.0 / 1.15
+                new_zoom = float(np.clip(zoom * factor, ZOOM_MIN, ZOOM_MAX))
+                if new_zoom != zoom:
+                    mouse_screen = np.array([mx, my], dtype=np.float32)
+                    mouse_world = (mouse_screen - win_center) / zoom + camera_world
+                    camera_world = mouse_world - (mouse_screen - win_center) / new_zoom
+                    zoom = new_zoom
+
+        if not paused:
+            if action_fn is not None:
+                a = action_fn(np.asarray(obs))
+                action = jnp.asarray(a)
+            else:
+                action = jnp.zeros((params.n_agents, act_dim), dtype=jnp.float32)
+            env_state, obs, r, done, info = step_b(env_state, action)
+            step_count += 1
+            last_reward = float(r[0])
+            last_shape_err = float(info["shape_err"][0])
+            last_shape_err_n = float(info["shape_err_n"][0])
+            last_solved = float(info["solved"][0])
+
+        pos = np.asarray(env_state.pos[0])
+        target = np.asarray(env_state.target[0])
+        emissions = np.asarray(env_state.last_emissions[0])
+        shape_id = int(env_state.shape_id[0])
+        SHAPE_NAMES = ["circle", "square", "triangle", "hexagon", "line"]
+        centroid = pos.mean(axis=0)
+
+        # Follow: EMA camera_world toward centroid (only when follow is on).
+        if follow_camera:
+            camera_world = camera_world + CAMERA_EMA * (centroid - camera_world)
+
+        # Pre-transform world points to screen for the existing draw helpers.
+        pos_s = _w2s(pos, camera_world, zoom, win_center)
+        target_s = _w2s(target, camera_world, zoom, win_center)
+
+        renderer.clear()
+        _draw_extended_grid(renderer.surface, camera_world, zoom, win_center)
+        _draw_world_border(renderer.surface, world_w, world_h,
+                           camera_world, zoom, win_center)
+        draw_target(renderer.surface, target_s)
+        if show_ghost:
+            draw_ghost(renderer.surface, target_s, pos_s.mean(axis=0))
+        if show_waves:
+            # Wave glow radii are world-units × amplitude — scale by zoom so
+            # halos shrink/grow with the agents.
+            draw_wave_glow(renderer.overlay, pos_s, emissions,
+                           params.lambda_short * zoom,
+                           params.lambda_long * zoom)
+        draw_agents(renderer.surface, pos_s)
+
+        renderer.draw_text("swarm-v0", 12, 10, big=True)
+        renderer.draw_hud_block([
+            f"shape:    {SHAPE_NAMES[shape_id]}",
+            f"step:     {step_count} / {params.timestep_limit}",
+            f"err:      {last_shape_err:7.2f} px   (norm {last_shape_err_n:.3f}, solve ≤ {params.solve_threshold})",
+            f"reward:   {last_reward:+.4f}",
+            f"solved:   {'yes' if last_solved > 0.5 else 'no'}",
+            f"view:     zoom×{zoom:.2f}  {'follow' if follow_camera else 'manual'}  centroid=({centroid[0]:.0f}, {centroid[1]:.0f})",
+        ], 12, 36)
+        for i, line in enumerate(help_lines):
+            renderer.draw_text(line, world_w - 250, 10 + i * 17, color=(110, 118, 130))
+        if paused:
+            renderer.draw_text("[PAUSED]", world_w - 100, world_h - 20,
+                                color=(180, 60, 60), big=True)
+        renderer.flip()
+        clock.tick(30)
+
+    renderer.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env", choices=["hyro", "linear", "pursuit", "gathering"],
+    parser.add_argument("--env", choices=["hyro", "linear", "pursuit", "gathering", "swarm"],
                         default=None)
     parser.add_argument("--run", type=Path, default=None,
                         help="If set, drive the env with a trained policy from this run dir.")
+    parser.add_argument("--opp-model", type=str, default=None,
+                        help="(Self-play only) override the opponent path saved "
+                             "in the run's args.")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+
+    # Self-play checkpoints carry a "role" field. Dispatch to the dual-agent
+    # viewer when we find one.
+    if args.run is not None:
+        with (args.run / "model.pkl").open("rb") as f:
+            _peek_ckpt = pickle.load(f)
+        if "role" in _peek_ckpt.get("args", {}) or "role" in _peek_ckpt:
+            return run_2d_viewer_selfplay(args, _peek_ckpt)
 
     env_kind, action_fn = load_policy(args.run, args.env)
     if env_kind in ("pursuit", "gathering"):
         return run_2d_viewer(env_kind, action_fn, args)
+    if env_kind == "swarm":
+        return run_swarm_viewer(action_fn, args)
 
     params = default_hyro_params() if env_kind == "hyro" else default_linear_params()
     state = build_state(env_kind, params, args.seed)
