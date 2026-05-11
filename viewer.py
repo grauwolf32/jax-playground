@@ -174,8 +174,9 @@ def load_policy(run_dir: Path, env_kind_hint: str | None):
         ckpt = pickle.load(f)
     saved_args = ckpt["args"]
     env_kind = env_kind_hint or saved_args["env"]
-    obs_dim = 43 if env_kind == "hyro" else 65
-    act_dim = 4 if env_kind == "hyro" else 6
+    from jax_playground import envs as envlib
+    obs_dim = envlib.REGISTRY[env_kind]["obs_dim"]
+    act_dim = envlib.REGISTRY[env_kind]["act_dim"]
 
     # Build a fresh ActorCritic with the saved arch, run a deterministic forward.
     model = ActorCritic(
@@ -280,20 +281,185 @@ def init_gl():
     gluPerspective(45.0, WIN_W / WIN_H, 0.05, 200.0)
 
 
+# --------------------------------------------------------------------------
+# 2D pygame viewer (pursuit, gathering)
+# --------------------------------------------------------------------------
+
+
+# Keyboard control mapping for 2D vehicles. WASD → (alpha, beta) ∈ [-1, 1]².
+# A/D rotate visually CCW/CW (i.e. decrease/increase phi since +y is down in
+# screen coords).
+def _keyboard_action_2d(keys) -> np.ndarray:
+    from pygame.locals import K_w, K_s, K_a, K_d
+    alpha = (1.0 if keys[K_w] else 0.0) - (1.0 if keys[K_s] else 0.0)
+    beta = (1.0 if keys[K_d] else 0.0) - (1.0 if keys[K_a] else 0.0)
+    return np.array([alpha, beta], dtype=np.float32)
+
+
+def run_2d_viewer(env_kind: str, action_fn, args) -> None:
+    """Pygame 2D viewer for pursuit + gathering envs.
+
+    Layout:
+      Window size = world size (960×720). Anti-aliased vehicle arrows,
+      fading per-agent trails, translucent catch-zone for pursuit, halos
+      around targets for gathering, on-screen HUD.
+
+    Drives the env with either the trained policy (if --run given) or
+    keyboard (WASD = thrust + steering).
+    """
+    import pygame as pg
+    from collections import deque
+
+    from jax_playground import envs as envlib
+    from jax_playground.render2d import (
+        Renderer2D, PURSUER, EVADER, AGENT, TARGET,
+        CATCH_ZONE, TRAIL_PURSUER, TRAIL_EVADER, TEXT,
+    )
+    from jax_playground.envs.pursuit.vehicle import default_params as default_v_params
+
+    params = default_v_params()
+    reset_b, step_b, obs_dim, act_dim = envlib.make_batched(env_kind, params, 1)
+
+    rng = jax.random.PRNGKey(args.seed)
+    rng, k = jax.random.split(rng)
+    env_state, obs = reset_b(k)
+
+    world_w = int(params.world_w)
+    world_h = int(params.world_h)
+    title = f"{env_kind}-v0"
+    renderer = Renderer2D(world_w, world_h, title)
+
+    trails = {
+        "evader": deque(maxlen=300),
+        "pursuer": deque(maxlen=300),
+        "agent": deque(maxlen=300),
+    }
+    paused = False
+    step_count = 0
+    clock = pg.time.Clock()
+    running = True
+    help_lines = (
+        ["WASD       drive (thrust + steer)"] if action_fn is None else
+        ["policy from --run is driving"]
+    ) + [
+        "Space      pause",
+        "Backspace  reset",
+        "Esc        quit",
+    ]
+
+    while running:
+        # ---- input ------------------------------------------------------
+        for ev in pg.event.get():
+            if ev.type == pg.QUIT:
+                running = False
+            elif ev.type == pg.KEYDOWN:
+                if ev.key == pg.K_ESCAPE or ev.key == pg.K_q:
+                    running = False
+                elif ev.key == pg.K_SPACE:
+                    paused = not paused
+                elif ev.key == pg.K_BACKSPACE:
+                    rng, k = jax.random.split(rng)
+                    env_state, obs = reset_b(k)
+                    step_count = 0
+                    for d in trails.values():
+                        d.clear()
+
+        if not paused:
+            # Action
+            if action_fn is not None:
+                action = action_fn(np.asarray(obs[0]))[None, :]
+                action = jnp.asarray(action)
+            else:
+                a = _keyboard_action_2d(pg.key.get_pressed())
+                action = jnp.asarray(a[None, :])
+            env_state, obs, r, done, info = step_b(env_state, action)
+            step_count += 1
+
+        # ---- read state for rendering -----------------------------------
+        if env_kind == "pursuit":
+            evader = np.asarray(env_state.evader[0])
+            pursuer = np.asarray(env_state.pursuer[0])
+            trails["evader"].append((float(evader[0]), float(evader[1])))
+            trails["pursuer"].append((float(pursuer[0]), float(pursuer[1])))
+        else:  # gathering
+            agent = np.asarray(env_state.agent[0])
+            target_1 = np.asarray(env_state.target_1[0])
+            target_2 = np.asarray(env_state.target_2[0])
+            score = float(env_state.score[0])
+            trails["agent"].append((float(agent[0]), float(agent[1])))
+
+        # ---- draw -------------------------------------------------------
+        renderer.clear()
+        renderer.draw_grid()
+        renderer.draw_border()
+
+        if env_kind == "pursuit":
+            from jax_playground.envs.pursuit.env import _CATCH_RADIUS
+            renderer.draw_catch_zone(float(pursuer[0]), float(pursuer[1]),
+                                      float(_CATCH_RADIUS))
+            renderer.draw_trail(list(trails["pursuer"]), TRAIL_PURSUER)
+            renderer.draw_trail(list(trails["evader"]), TRAIL_EVADER)
+            renderer.draw_vehicle(float(pursuer[0]), float(pursuer[1]),
+                                   float(pursuer[6]), PURSUER)
+            renderer.draw_vehicle(float(evader[0]), float(evader[1]),
+                                   float(evader[6]), EVADER)
+
+            d = float(np.hypot(pursuer[0] - evader[0], pursuer[1] - evader[1]))
+            renderer.draw_text("pursuit-v0", 12, 10, big=True)
+            renderer.draw_hud_block([
+                f"t      {step_count * params.dt:6.2f} s   (step {step_count})",
+                f"d      {d:7.2f}   (catch ≤ 80)",
+                f"pursuer v = {float(np.hypot(pursuer[2], pursuer[3])):5.2f}",
+                f"evader  v = {float(np.hypot(evader[2], evader[3])):5.2f}",
+                f"reward = {float(r[0]):+.4f}",
+            ], 12, 36)
+            renderer.draw_text("pursuer", 12, world_h - 38, color=PURSUER, big=True)
+            label = "evader (policy)" if action_fn else "evader (keyboard)"
+            renderer.draw_text(label, 12, world_h - 20, color=EVADER)
+        else:  # gathering
+            from jax_playground.envs.gathering.env import _TARGET_RADIUS
+            for t in (target_1, target_2):
+                renderer.draw_target(float(t[0]), float(t[1]),
+                                      float(_TARGET_RADIUS), color=TARGET)
+            renderer.draw_trail(list(trails["agent"]), TRAIL_EVADER)
+            renderer.draw_vehicle(float(agent[0]), float(agent[1]),
+                                   float(agent[6]), AGENT)
+            renderer.draw_text("gathering-v0", 12, 10, big=True)
+            renderer.draw_hud_block([
+                f"t      {step_count * params.dt:6.2f} s   (step {step_count})",
+                f"score  {int(score)}",
+                f"v      {float(np.hypot(agent[2], agent[3])):5.2f}",
+                f"reward = {float(r[0]):+.4f}",
+            ], 12, 36)
+            label = "agent (policy)" if action_fn else "agent (keyboard)"
+            renderer.draw_text(label, 12, world_h - 20, color=AGENT)
+
+        # Help in the top right.
+        for i, line in enumerate(help_lines):
+            renderer.draw_text(line, world_w - 250, 10 + i * 17, color=(110, 118, 130))
+        if paused:
+            renderer.draw_text("[PAUSED]", world_w - 100, world_h - 20,
+                                color=(180, 60, 60), big=True)
+
+        renderer.flip()
+        clock.tick(int(1.0 / float(params.dt)))   # match dt to wall-clock
+
+    renderer.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env", choices=["hyro", "linear"], default=None)
+    parser.add_argument("--env", choices=["hyro", "linear", "pursuit", "gathering"],
+                        default=None)
     parser.add_argument("--run", type=Path, default=None,
                         help="If set, drive the env with a trained policy from this run dir.")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     env_kind, action_fn = load_policy(args.run, args.env)
-    if env_kind not in ("hyro", "linear"):
-        raise SystemExit(
-            f"viewer.py currently only supports hyro/linear (3D OpenGL). "
-            f"For {env_kind!r}, use play.py for headless eval until the 2D "
-            f"renderer is ported.")
+    if env_kind in ("pursuit", "gathering"):
+        return run_2d_viewer(env_kind, action_fn, args)
+
     params = default_hyro_params() if env_kind == "hyro" else default_linear_params()
     state = build_state(env_kind, params, args.seed)
 
