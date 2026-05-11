@@ -1,15 +1,17 @@
-"""Single-file JAX PPO training for HyroSphere / LinearSphere.
+"""Single-file JAX PPO training across the jax_playground env set.
 
 PureJaxRL-style: env + rollout + GAE + minibatch updates all live inside a
 single `jax.jit`-compiled function and run end-to-end on GPU. Throughput is
 typically 50-200× a CPU + SubprocVecEnv stack at the same `n_envs`.
 
 Usage:
-  poetry run python train.py --env hyro --updates 200 --n-envs 256
-  poetry run python train.py --env linear --updates 500 --n-envs 512
+  poetry run python train.py --env hyro     --updates 200 --n-envs 256
+  poetry run python train.py --env linear   --updates 500 --n-envs 512
+  poetry run python train.py --env pursuit  --updates 500 --n-envs 1024
+  poetry run python train.py --env gathering --updates 500 --n-envs 1024
 
 Checkpoints land in runs/<env>-<timestamp>/ as a pickled (params, opt_state,
-norm_stats) tuple plus a `metrics.csv` of mean episode return / peak z.
+norm_stats) tuple plus a `metrics.csv` of mean episode return.
 """
 
 from __future__ import annotations
@@ -21,97 +23,16 @@ import time
 from pathlib import Path
 from typing import NamedTuple
 
-import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 
-from jax_hyrosphere import env as envlib
-from jax_hyrosphere.physics import default_hyro_params, default_linear_params
-
-
-# --------------------------------------------------------------------------
-# Actor-Critic network
-# --------------------------------------------------------------------------
-
-
-class ActorCritic(nn.Module):
-    act_dim: int
-    hidden: tuple = (256, 256)
-    log_std_init: float = 0.0
-
-    @nn.compact
-    def __call__(self, x):
-        # Actor trunk
-        a = x
-        for h in self.hidden:
-            a = nn.tanh(nn.Dense(h, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(a))
-        mean = nn.Dense(
-            self.act_dim,
-            kernel_init=nn.initializers.orthogonal(0.01),
-            bias_init=nn.initializers.zeros,
-        )(a)
-        log_std = self.param("log_std", lambda _, shape: jnp.full(shape, self.log_std_init),
-                              (self.act_dim,))
-
-        # Critic trunk
-        c = x
-        for h in self.hidden:
-            c = nn.tanh(nn.Dense(h, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(c))
-        value = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(c).squeeze(-1)
-        return mean, log_std, value
-
-
-def gaussian_log_prob(action, mean, log_std):
-    """Per-action-dim log p of a Gaussian with state-independent log_std."""
-    std = jnp.exp(log_std)
-    return jnp.sum(
-        -0.5 * jnp.log(2 * jnp.pi) - log_std - 0.5 * ((action - mean) / std) ** 2,
-        axis=-1,
-    )
-
-
-def gaussian_entropy(log_std):
-    return jnp.sum(0.5 * jnp.log(2.0 * jnp.pi * jnp.e) + log_std, axis=-1)
-
-
-# --------------------------------------------------------------------------
-# Observation normalization (running mean/std, à la VecNormalize)
-# --------------------------------------------------------------------------
-
-
-class RunningStats(NamedTuple):
-    mean: jnp.ndarray
-    var: jnp.ndarray
-    count: jnp.ndarray  # scalar
-
-
-def init_running_stats(dim: int) -> RunningStats:
-    return RunningStats(
-        mean=jnp.zeros(dim, dtype=jnp.float32),
-        var=jnp.ones(dim, dtype=jnp.float32),
-        count=jnp.float32(1e-4),
-    )
-
-
-def update_running_stats(stats: RunningStats, batch: jnp.ndarray) -> RunningStats:
-    """Welford-style parallel update for a batch of observations (batch, dim)."""
-    batch_count = jnp.float32(batch.shape[0])
-    batch_mean = jnp.mean(batch, axis=0)
-    batch_var = jnp.var(batch, axis=0)
-    delta = batch_mean - stats.mean
-    tot = stats.count + batch_count
-    new_mean = stats.mean + delta * batch_count / tot
-    m_a = stats.var * stats.count
-    m_b = batch_var * batch_count
-    m2 = m_a + m_b + delta ** 2 * stats.count * batch_count / tot
-    new_var = m2 / tot
-    return RunningStats(mean=new_mean, var=new_var, count=tot)
-
-
-def normalize(obs, stats: RunningStats, clip: float = 10.0):
-    return jnp.clip((obs - stats.mean) / jnp.sqrt(stats.var + 1e-8), -clip, clip)
+from jax_playground import envs as envlib
+from jax_playground.policy import (
+    ActorCritic, RunningStats, gaussian_entropy, gaussian_log_prob,
+    init_running_stats, normalize, update_running_stats,
+)
 
 
 # --------------------------------------------------------------------------
@@ -322,7 +243,7 @@ def make_train_step(env_kind: str, params, args):
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--env", choices=["hyro", "linear"], default="hyro")
+    p.add_argument("--env", choices=envlib.list_envs(), default="hyro")
     p.add_argument("--updates", type=int, default=200,
                    help="Number of PPO update cycles to run.")
     p.add_argument("--n-envs", type=int, default=256)
@@ -346,10 +267,7 @@ def main() -> None:
     p.add_argument("--name", default=None)
     args = p.parse_args()
 
-    if args.env == "hyro":
-        params = default_hyro_params()
-    else:
-        params = default_linear_params()
+    params = envlib.REGISTRY[args.env]["default_params"]()
 
     run_name = args.name or f"{args.env}-{time.strftime('%Y%m%d-%H%M%S')}"
     run_dir = Path("runs") / run_name

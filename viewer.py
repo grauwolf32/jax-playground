@@ -58,19 +58,23 @@ from OpenGL.GLUT import (
     GLUT_BITMAP_9_BY_15, GLUT_BITMAP_HELVETICA_18, GLUT_BITMAP_HELVETICA_12,
 )
 
-from jax_hyrosphere import env as envlib
-from jax_hyrosphere.physics import (
-    HyroState, LinearState, HyroParams, LinearParams,
-    default_hyro_params, default_linear_params,
-    hyro_reset, hyro_step, linear_reset, linear_step,
-    _hyro_wheel_geometry,
+from jax_playground import envs as envlib
+from jax_playground.envs.hyrosphere.physics import (
+    HyroParams, HyroState, default_params as default_hyro_params,
+    reset as hyro_reset, step as hyro_step, wheel_geometry as _hyro_wheel_geometry,
 )
-from jax_hyrosphere.viz import (
+from jax_playground.envs.linearsphere.physics import (
+    LinearParams, LinearState, default_params as default_linear_params,
+    reset as linear_reset, step as linear_step,
+)
+from jax_playground.viz3d import (
     OrbitCamera, drawGroundGrid, drawCOMMarker, drawBodyAxes,
     drawOmegaArrow, drawContactAndFriction, drawText2D,
     drawHyrosphere, drawLinearsphere, drawTrajectory, drawMiniPlot,
     setupLighting,
 )
+# Module-level so pickle finds RunningStats/ActorCritic in viewer's __main__.
+from jax_playground.policy import ActorCritic, RunningStats, normalize  # noqa: E402
 
 
 WIN_W, WIN_H = 1280, 800
@@ -174,7 +178,6 @@ def load_policy(run_dir: Path, env_kind_hint: str | None):
     act_dim = 4 if env_kind == "hyro" else 6
 
     # Build a fresh ActorCritic with the saved arch, run a deterministic forward.
-    from train import ActorCritic, normalize, RunningStats
     model = ActorCritic(
         act_dim=act_dim,
         hidden=tuple(saved_args["hidden"]),
@@ -286,6 +289,11 @@ def main():
     args = parser.parse_args()
 
     env_kind, action_fn = load_policy(args.run, args.env)
+    if env_kind not in ("hyro", "linear"):
+        raise SystemExit(
+            f"viewer.py currently only supports hyro/linear (3D OpenGL). "
+            f"For {env_kind!r}, use play.py for headless eval until the 2D "
+            f"renderer is ported.")
     params = default_hyro_params() if env_kind == "hyro" else default_linear_params()
     state = build_state(env_kind, params, args.seed)
 

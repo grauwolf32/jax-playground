@@ -19,9 +19,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jax_hyrosphere import env as envlib
-from jax_hyrosphere.physics import default_hyro_params, default_linear_params
-from train import ActorCritic, normalize, init_running_stats, RunningStats
+from jax_playground import envs as envlib
+from jax_playground.policy import (
+    ActorCritic, RunningStats, init_running_stats, normalize,
+)
 
 
 def latest_run(runs_dir: Path) -> Path:
@@ -34,7 +35,7 @@ def latest_run(runs_dir: Path) -> Path:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--run", type=Path, default=None)
-    p.add_argument("--env", choices=["hyro", "linear"], default=None,
+    p.add_argument("--env", choices=envlib.list_envs(), default=None,
                    help="If not set, inferred from the checkpoint's saved args.")
     p.add_argument("--episodes", type=int, default=5)
     p.add_argument("--max-steps", type=int, default=2000)
@@ -50,7 +51,7 @@ def main() -> None:
     env_kind = args.env or saved_args["env"]
     print(f"[play] run={run_dir}  env={env_kind}  deterministic={not args.stochastic}")
 
-    params = default_hyro_params() if env_kind == "hyro" else default_linear_params()
+    params = envlib.REGISTRY[env_kind]["default_params"]()
     reset_fn, step_fn, obs_dim, act_dim = envlib.make_batched(env_kind, params, 1)
 
     model = ActorCritic(
@@ -74,28 +75,47 @@ def main() -> None:
             return mean + jnp.exp(log_std) * noise
         return mean
 
+    # Optional per-env diagnostic: peak_z for spheres, distance/score for
+    # pursuit/gathering. Look up in env state by attribute name.
+    if env_kind in ("hyro", "linear"):
+        def env_diag(env_state):
+            return ("peak_z", float(env_state.phys.peak_z[0]))
+    elif env_kind == "pursuit":
+        def env_diag(env_state):
+            ev = env_state.evader[0]
+            pu = env_state.pursuer[0]
+            return ("min_d_seen", float(jnp.sqrt(
+                (ev[0] - pu[0]) ** 2 + (ev[1] - pu[1]) ** 2
+            )))
+    elif env_kind == "gathering":
+        def env_diag(env_state):
+            return ("score", float(env_state.score[0]))
+    else:
+        env_diag = lambda env_state: ("-", 0.0)
+
     rng = jax.random.PRNGKey(args.seed)
     rng, k = jax.random.split(rng)
     env_state, obs = reset_fn(k)
-    returns, peaks = [], []
+    returns = []
+    diags = []
     for ep in range(args.episodes):
         rng, k_reset = jax.random.split(rng)
         env_state, obs = reset_fn(k_reset)
         ep_ret = 0.0
-        peak = float(env_state.phys.position[0, 2])
         for step in range(args.max_steps):
             rng, k = jax.random.split(rng)
             action = policy(obs, k)
             env_state, obs, r, done, _info = step_fn(env_state, action)
             ep_ret += float(r[0])
-            peak = max(peak, float(env_state.phys.position[0, 2]))
             if bool(done[0]):
                 break
+        diag_name, diag_val = env_diag(env_state)
         returns.append(ep_ret)
-        peaks.append(peak)
-        print(f"[play] ep {ep+1:2d}/{args.episodes}  return={ep_ret:+8.2f}  peak_z={peak:.3f}")
+        diags.append(diag_val)
+        print(f"[play] ep {ep+1:2d}/{args.episodes}  return={ep_ret:+9.2f}  {diag_name}={diag_val:.3f}")
     if returns:
         print(f"\n[play] mean return  = {np.mean(returns):+.2f}  (std {np.std(returns):.2f})")
+        print(f"[play] mean {diag_name} = {np.mean(diags):.3f}")
         print(f"[play] mean peak_z  = {np.mean(peaks):.3f}")
 
 

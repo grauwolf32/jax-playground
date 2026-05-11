@@ -1,10 +1,10 @@
 [tool.poetry]
-name = "jax-hyrosphere"
+name = "jax-playground"
 version = "0.1.0"
-description = "JAX rewrite of the HyroSphere / LinearSphere physics + PPO training, vectorized via jax.vmap and jit-compiled."
+description = "JAX-native physics environments + PPO. Hyrosphere, linearsphere, pursuit, gathering — all vectorized via jax.vmap, jit-compiled, end-to-end on GPU."
 authors = ["grauwolf32"]
 readme = "README.md"
-packages = [{ include = "jax_hyrosphere" }]
+packages = [{ include = "jax_playground" }]
 
 [tool.poetry.dependencies]
 python = "^3.12"
