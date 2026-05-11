@@ -254,25 +254,48 @@ def make_train_step(env_kind: str, params, args):
         # Drop the tail so reshape is exact (n_mb · minibatch ≤ n_samples).
         n_truncated = n_mb * args.minibatch
 
-        def one_epoch(carry, key):
-            opt_state, net_params = carry
+        def _do_epoch(opt_state, net_params, key):
             perm = jax.random.permutation(key, n_samples)[:n_truncated]
-            # Reshape to (n_mb, minibatch); indexing perm_mat[i] gives one MB's indices.
             perm_mat = perm.reshape(n_mb, args.minibatch)
             def mb_body(carry, idx_row):
-                opt_state, net_params = carry
+                os_, np_ = carry
                 batch = (b_obs[idx_row], b_action[idx_row], b_old_logp[idx_row],
                          b_adv[idx_row], b_ret[idx_row])
-                opt_state, net_params, _ = update_minibatch(opt_state, net_params, batch)
-                return (opt_state, net_params), 0
+                os_, np_, _ = update_minibatch(os_, np_, batch)
+                return (os_, np_), 0
             (opt_state, net_params), _ = jax.lax.scan(
                 mb_body, (opt_state, net_params), perm_mat
             )
-            return (opt_state, net_params), 0
+            return opt_state, net_params
+
+        def _skip_epoch(opt_state, net_params, _key):
+            return opt_state, net_params
+
+        def one_epoch(carry, key):
+            opt_state, net_params, stopped, n_executed = carry
+            # Run this epoch only if not yet stopped
+            opt_state, net_params = jax.lax.cond(
+                stopped, _skip_epoch, _do_epoch, opt_state, net_params, key
+            )
+            (_loss, metrics), _grads = grad_fn(
+                net_params, b_obs, b_action, b_old_logp, b_adv, b_ret
+            )
+            # An epoch counts as executed if we didn't skip it.
+            n_executed = jnp.where(stopped, n_executed, n_executed + 1)
+            # Stop if KL exceeds target OR has gone non-finite (NaN comparison
+            # returns False, which would silently keep training a corrupted net).
+            new_stopped = (
+                stopped
+                | (metrics["kl"] > args.target_kl)
+                | (~jnp.isfinite(metrics["kl"]))
+            )
+            return (opt_state, net_params, new_stopped, n_executed), metrics["kl"]
 
         rng, *epoch_keys = jax.random.split(rng, args.n_epochs + 1)
-        (opt_state, net_params), _ = jax.lax.scan(
-            one_epoch, (opt_state, net_params), jnp.stack(epoch_keys)
+        (opt_state, net_params, _stopped, n_executed), _epoch_kls = jax.lax.scan(
+            one_epoch,
+            (opt_state, net_params, jnp.bool_(False), jnp.int32(0)),
+            jnp.stack(epoch_keys),
         )
 
         # 5. final diagnostic pass on the full batch for logging
@@ -284,6 +307,7 @@ def make_train_step(env_kind: str, params, args):
         scalars = {
             "rew_mean": mean_reward,
             "done_frac": mean_done,
+            "epochs_used": n_executed,
             **metrics,
         }
         return carry, scalars
@@ -313,6 +337,9 @@ def main() -> None:
     p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
+    p.add_argument("--target-kl", type=float, default=0.02,
+                   help="Skip remaining epochs in a rollout once approx-KL "
+                        "exceeds this (SB3-style early stop).")
     p.add_argument("--hidden", type=int, nargs="+", default=[256, 256])
     p.add_argument("--log-std-init", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=0)
@@ -369,6 +396,7 @@ def main() -> None:
                   f"clip={scalars['clip']:.3f}  "
                   f"ent={scalars['ent']:+.3f}  "
                   f"v_loss={scalars['v']:.4f}  "
+                  f"ep={int(scalars['epochs_used'])}/{args.n_epochs}  "
                   f"t={elapsed:.0f}s  "
                   f"sps={steps/max(elapsed,1e-9):,.0f}")
             writer.writerow([update + 1, f"{elapsed:.1f}",
