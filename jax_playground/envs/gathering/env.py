@@ -20,7 +20,7 @@ from jax_playground.envs.pursuit import vehicle
 from jax_playground.envs.pursuit.vehicle import VehicleParams
 
 
-OBS_DIM = 12
+OBS_DIM = 13
 ACT_DIM = 2
 
 _TARGET_RADIUS = jnp.float32(80.0)
@@ -59,7 +59,7 @@ def _random_place(key, params: VehicleParams):
     return vehicle.init_state(x, y, phi)
 
 
-def _obs(es: EnvState) -> jnp.ndarray:
+def _obs(es: EnvState, params: VehicleParams) -> jnp.ndarray:
     s = es.agent
     dx1, dy1 = s[0] - es.target_1[0], s[1] - es.target_1[1]
     dx2, dy2 = s[0] - es.target_2[0], s[1] - es.target_2[1]
@@ -68,13 +68,14 @@ def _obs(es: EnvState) -> jnp.ndarray:
     cp, sp = jnp.cos(s[6]), jnp.sin(s[6])
     t1a = vehicle.signed_angle(cp, sp, -dx1, -dy1)
     t2a = vehicle.signed_angle(cp, sp, -dx2, -dy2)
-    # Permutation-invariant: nearest target first.
     swap = d1 > d2
     d1, d2 = jnp.where(swap, d2, d1), jnp.where(swap, d1, d2)
     t1a, t2a = jnp.where(swap, t2a, t1a), jnp.where(swap, t1a, t2a)
+    front_dist = vehicle.ray_distance(s[0], s[1], s[6], params)
     return jnp.array([
         s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
         d1, t1a, d2, t2a,
+        front_dist,
     ], dtype=jnp.float32)
 
 
@@ -87,7 +88,7 @@ def env_reset(key: jax.Array, params: VehicleParams):
         agent=agent, target_1=t1, target_2=t2,
         score=jnp.float32(0.0), step=jnp.int32(0), key=k_next,
     )
-    return es, _obs(es)
+    return es, _obs(es, params)
 
 
 def env_step(es: EnvState, action: jnp.ndarray, params: VehicleParams):
@@ -142,4 +143,4 @@ def env_step(es: EnvState, action: jnp.ndarray, params: VehicleParams):
         agent=final_agent, target_1=final_t1, target_2=final_t2,
         score=final_score, step=final_step, key=next_key2,
     )
-    return new_es, _obs(new_es), reward, done, {"score": new_score}
+    return new_es, _obs(new_es, params), reward, done, {"score": new_score}

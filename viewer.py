@@ -288,11 +288,14 @@ def init_gl():
 
 # Keyboard control mapping for 2D vehicles. WASD → (alpha, beta) ∈ [-1, 1]².
 # A/D rotate visually CCW/CW (i.e. decrease/increase phi since +y is down in
-# screen coords).
+# screen coords). beta is scaled down so held-key turning is smooth at the
+# 30-fps viewer tick (the physics has dt=0.5 → 1 ray of turn per step at full
+# beta = 57°/step is jarring to drive).
+TURN_RATE = 0.3   # fraction of max_dw applied per held key
 def _keyboard_action_2d(keys) -> np.ndarray:
     from pygame.locals import K_w, K_s, K_a, K_d
     alpha = (1.0 if keys[K_w] else 0.0) - (1.0 if keys[K_s] else 0.0)
-    beta = (1.0 if keys[K_d] else 0.0) - (1.0 if keys[K_a] else 0.0)
+    beta = ((1.0 if keys[K_d] else 0.0) - (1.0 if keys[K_a] else 0.0)) * TURN_RATE
     return np.array([alpha, beta], dtype=np.float32)
 
 

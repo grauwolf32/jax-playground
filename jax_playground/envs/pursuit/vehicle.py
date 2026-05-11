@@ -186,3 +186,58 @@ def signed_angle(cp, sp, dx, dy):
     cross = cp * dy - sp * dx
     dot = cp * dx + sp * dy
     return jnp.arctan2(cross, dot)
+
+
+def _ray_aabb_t(px, py, dx, dy, x0, y0, x1, y1):
+    """Parametric distance along ray (px,py)+t·(dx,dy) to AABB.
+
+    Returns +inf if no intersection ahead (t ≤ 0 cases yield +inf too).
+    Direction (dx, dy) need not be unit length; t is in units of |d|⁻¹·meters.
+    For unit direction this is the Euclidean distance.
+    """
+    eps = 1e-6
+    safe_dx = jnp.where(jnp.abs(dx) < eps, eps, dx)
+    safe_dy = jnp.where(jnp.abs(dy) < eps, eps, dy)
+    tx1 = (x0 - px) / safe_dx
+    tx2 = (x1 - px) / safe_dx
+    ty1 = (y0 - py) / safe_dy
+    ty2 = (y1 - py) / safe_dy
+    tmin_x = jnp.minimum(tx1, tx2)
+    tmax_x = jnp.maximum(tx1, tx2)
+    tmin_y = jnp.minimum(ty1, ty2)
+    tmax_y = jnp.maximum(ty1, ty2)
+    t_enter = jnp.maximum(tmin_x, tmin_y)
+    t_exit = jnp.minimum(tmax_x, tmax_y)
+    hit = (t_enter <= t_exit) & (t_exit > 0)
+    return jnp.where(hit, jnp.maximum(t_enter, 0.0), jnp.inf)
+
+
+def ray_distance(px, py, phi, params: VehicleParams) -> jnp.ndarray:
+    """Distance from (px, py) along heading (cos phi, sin phi) to the
+    nearest blocker — any obstacle face or arena wall ahead. The agent's
+    own body is treated as a point, so a vehicle near a wall sees the wall
+    as the closest hit and gets distance ~0.
+    """
+    dx = jnp.cos(phi)
+    dy = jnp.sin(phi)
+    eps = 1e-6
+    safe_dx = jnp.where(jnp.abs(dx) < eps, eps, dx)
+    safe_dy = jnp.where(jnp.abs(dy) < eps, eps, dy)
+
+    # Arena walls (vehicle is inside the box). For each face, the ray hits
+    # at t = (face_coord - p) / d when that t is positive.
+    t_left = (0.0 - px) / safe_dx
+    t_right = (params.world_w - px) / safe_dx
+    t_top = (0.0 - py) / safe_dy
+    t_bot = (params.world_h - py) / safe_dy
+    arena_candidates = jnp.stack([t_left, t_right, t_top, t_bot])
+    arena_t = jnp.min(jnp.where(arena_candidates > 0, arena_candidates, jnp.inf))
+
+    # Obstacles
+    obs_t = jnp.inf
+    for i in range(params.obstacles.shape[0]):
+        x0, y0, x1, y1 = (params.obstacles[i, 0], params.obstacles[i, 1],
+                          params.obstacles[i, 2], params.obstacles[i, 3])
+        obs_t = jnp.minimum(obs_t, _ray_aabb_t(px, py, dx, dy, x0, y0, x1, y1))
+
+    return jnp.minimum(arena_t, obs_t)

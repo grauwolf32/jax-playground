@@ -23,7 +23,7 @@ from jax_playground.envs.pursuit import vehicle
 from jax_playground.envs.pursuit.vehicle import VehicleParams, default_params
 
 
-OBS_DIM = 14
+OBS_DIM = 15
 ACT_DIM = 2
 
 _CATCH_RADIUS = jnp.float32(80.0)
@@ -53,7 +53,7 @@ def _random_place(key: jax.Array, params: VehicleParams):
     return vehicle.init_state(x, y, phi)
 
 
-def _obs(es: EnvState) -> jnp.ndarray:
+def _obs(es: EnvState, params: VehicleParams) -> jnp.ndarray:
     e = es.evader
     p = es.pursuer
     dx_rel = p[0] - e[0]
@@ -62,9 +62,11 @@ def _obs(es: EnvState) -> jnp.ndarray:
     dvy_rel = p[3] - e[3]
     dphi_rel = p[6] - e[6]
     d = jnp.sqrt(dx_rel * dx_rel + dy_rel * dy_rel)
+    front_dist = vehicle.ray_distance(e[0], e[1], e[6], params)
     return jnp.array([
         e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7],
         dx_rel, dy_rel, dvx_rel, dvy_rel, dphi_rel, d,
+        front_dist,
     ], dtype=jnp.float32)
 
 
@@ -73,7 +75,7 @@ def env_reset(key: jax.Array, params: VehicleParams):
     pursuer = _random_place(k_p, params)
     evader = _random_place(k_e, params)
     es = EnvState(pursuer=pursuer, evader=evader, step=jnp.int32(0), key=k_next)
-    return es, _obs(es)
+    return es, _obs(es, params)
 
 
 def env_step(es: EnvState, action: jnp.ndarray, params: VehicleParams):
@@ -121,4 +123,4 @@ def env_step(es: EnvState, action: jnp.ndarray, params: VehicleParams):
 
     new_es = EnvState(pursuer=final_pursuer, evader=final_evader,
                        step=final_step, key=next_key)
-    return new_es, _obs(new_es), reward, done, {"distance": d, "caught": caught}
+    return new_es, _obs(new_es, params), reward, done, {"distance": d, "caught": caught}
