@@ -241,3 +241,20 @@ def ray_distance(px, py, phi, params: VehicleParams) -> jnp.ndarray:
         obs_t = jnp.minimum(obs_t, _ray_aabb_t(px, py, dx, dy, x0, y0, x1, y1))
 
     return jnp.minimum(arena_t, obs_t)
+
+
+# Body-frame ray directions for the lidar obs feature.  N rays evenly spaced
+# around the agent; ray 0 is front, ray N/4 is the agent's right, etc.
+N_RAYS = 8
+_RAY_ANGLES = jnp.linspace(0.0, 2.0 * jnp.pi, N_RAYS, endpoint=False).astype(jnp.float32)
+
+
+def lidar_distances(px, py, phi, params: VehicleParams) -> jnp.ndarray:
+    """Distance to the nearest blocker along each of N_RAYS body-frame rays.
+
+    Ray i is at angle (phi + 2π·i/N) — front, then sweeping CCW (in screen
+    coords, which is CW on screen since +y is down). Output shape (N_RAYS,).
+    """
+    def one(angle_offset):
+        return ray_distance(px, py, phi + angle_offset, params)
+    return jax.vmap(one)(_RAY_ANGLES)

@@ -20,7 +20,7 @@ from jax_playground.envs.pursuit import vehicle
 from jax_playground.envs.pursuit.vehicle import VehicleParams
 
 
-OBS_DIM = 13
+OBS_DIM = 18    # was 13: dropped 2 absolute coords + 1 front_dist, added 8 lidar
 ACT_DIM = 2
 
 _TARGET_RADIUS = jnp.float32(80.0)
@@ -71,12 +71,14 @@ def _obs(es: EnvState, params: VehicleParams) -> jnp.ndarray:
     swap = d1 > d2
     d1, d2 = jnp.where(swap, d2, d1), jnp.where(swap, d1, d2)
     t1a, t2a = jnp.where(swap, t2a, t1a), jnp.where(swap, t1a, t2a)
-    front_dist = vehicle.ray_distance(s[0], s[1], s[6], params)
-    return jnp.array([
-        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-        d1, t1a, d2, t2a,
-        front_dist,
-    ], dtype=jnp.float32)
+    lidar = vehicle.lidar_distances(s[0], s[1], s[6], params)   # (8,)
+    # Drop s[0], s[1] (world coords) — target info is already relative,
+    # so the policy can't memorize obstacle layout from this obs alone.
+    return jnp.concatenate([
+        jnp.array([s[2], s[3], s[4], s[5], s[6], s[7]], dtype=jnp.float32),   # 6
+        jnp.array([d1, t1a, d2, t2a], dtype=jnp.float32),                     # 4
+        lidar.astype(jnp.float32),    # 8
+    ])
 
 
 def env_reset(key: jax.Array, params: VehicleParams):
