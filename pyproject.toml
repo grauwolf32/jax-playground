@@ -16,7 +16,7 @@ optax = "^0.2.4"
 chex = "^0.1.86"
 numpy = "^2.1"
 tensorboard = "^2.18"
-setuptools = "^75.0"          # tensorboard imports pkg_resources
+setuptools = ">=75,<84"          # tensorboard imports pkg_resources
 tqdm = "^4.66"
 # Viewer dependencies (optional, only used by viewer.py — not needed for training).
 pygame-ce = "^2.5"     # community fork — mainline pygame 2.6 breaks pg.font on Python 3.14
